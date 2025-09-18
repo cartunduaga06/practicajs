@@ -1,0 +1,522 @@
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+
+// -------- Import robusto de Jimp (ESM/CommonJS) --------
+const JimpMod = require("jimp");
+const Jimp = JimpMod?.Jimp || JimpMod?.default || JimpMod;
+
+const app = express();
+app.use(express.json());
+
+app.get("/health", (_req, res) => res.send("API Católica funcionando correctamente"));
+
+// ---- Utils para fuentes mejoradas ----
+function pickSize(fontSize = 32) {
+  return fontSize >= 128 ? 128 : fontSize >= 64 ? 64 : fontSize >= 32 ? 32 : 16;
+}
+
+function constantFor(size) {
+  const map = {
+    16: Jimp?.FONT_SANS_16_BLACK,
+    32: Jimp?.FONT_SANS_32_BLACK,
+    64: Jimp?.FONT_SANS_64_BLACK,
+    128: Jimp?.FONT_SANS_128_BLACK,
+  };
+  return map[size];
+}
+
+function resolveIfExists(subpath) {
+  try { return require.resolve(subpath); } catch { return null; }
+}
+
+function resolveByWalk(bases, relPath) {
+  for (const base of bases) {
+    const full = path.join(base, relPath);
+    if (fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
+function getFontRef(fontSize) {
+  const s = pickSize(fontSize);
+  const c = constantFor(s);
+  if (c) return c;
+
+  const tryJimpExport = resolveIfExists(
+    `jimp/fonts/open-sans/open-sans-${s}-black/open-sans-${s}-black.fnt`
+  );
+  if (tryJimpExport) return tryJimpExport;
+
+  const bases = [
+    path.join(__dirname, "node_modules"),
+    path.join(process.cwd(), "node_modules"),
+  ];
+  const relJimp = path.join("jimp", "fonts", "open-sans", `open-sans-${s}-black`, `open-sans-${s}-black.fnt`);
+  const relPlugin = path.join("@jimp", "plugin-print", "fonts", "open-sans", `open-sans-${s}-black`, `open-sans-${s}-black.fnt`);
+
+  const p1 = resolveByWalk(bases, relJimp);
+  if (p1) return p1;
+  const p2 = resolveByWalk(bases, relPlugin);
+  if (p2) return p2;
+
+  throw new Error(
+    `No encontré la fuente de Jimp (${s}px). Soluciones: ` +
+    `1) "npm i jimp@0.21.3" (recomendado) ó 2) "npm i @jimp/plugin-print@0.22.10".`
+  );
+}
+
+// ---- Variable global para cachear el logo ----
+let cachedLogo = null;
+
+// ---- Función para cargar el logo desde archivo ----
+async function loadLogo() {
+  if (cachedLogo) {
+    return cachedLogo;
+  }
+
+  const logoPaths = [
+    path.join(__dirname, 'assets', 'logo-ave-maria.png'),
+    path.join(__dirname, 'assets', 'logo.png'),
+    path.join(__dirname, 'logo-ave-maria.png'),
+    path.join(__dirname, 'logo.png'),
+    path.join(process.cwd(), 'assets', 'logo-ave-maria.png'),
+    path.join(process.cwd(), 'logo.png'),
+  ];
+
+  for (const logoPath of logoPaths) {
+    if (fs.existsSync(logoPath)) {
+      try {
+        console.log(`✅ Logo encontrado en: ${logoPath}`);
+        cachedLogo = await Jimp.read(logoPath);
+        return cachedLogo;
+      } catch (error) {
+        console.warn(`⚠️ Error cargando logo desde ${logoPath}:`, error.message);
+      }
+    }
+  }
+
+  throw new Error(`❌ No se encontró el archivo del logo en ninguna de estas rutas:\n${logoPaths.join('\n')}\n\n📋 Instrucciones:\n1. Coloca tu logo en formato PNG en: ./assets/logo-ave-maria.png\n2. O en la carpeta raíz como: ./logo.png\n3. Asegúrate que tenga fondo transparente para mejor resultado`);
+}
+
+// ---- Función para aplicar el logo a la imagen ----
+async function applyLogoToImage(image, logoPosition, logoSize = 120) {
+  try {
+    const logo = await loadLogo();
+    
+    // Redimensionar logo manteniendo proporciones
+    const logoClone = logo.clone();
+    logoClone.resize(logoSize, logoSize);
+
+    // Calcular posiciones según el logoPosition
+    const { width, height } = image.bitmap;
+    const margin = Math.max(width * 0.08, 40); // Margen del 8%
+    
+    let logoX, logoY;
+    
+    switch (logoPosition) {
+      case 'top-left':
+        logoX = margin;
+        logoY = margin;
+        break;
+      case 'top-right':
+        logoX = width - logoSize - margin;
+        logoY = margin;
+        break;
+      case 'top-center':
+        logoX = (width - logoSize) / 2;
+        logoY = margin;
+        break;
+      case 'bottom-left':
+        logoX = margin;
+        logoY = height - logoSize - margin;
+        break;
+      case 'bottom-right':
+        logoX = width - logoSize - margin;
+        logoY = height - logoSize - margin;
+        break;
+      case 'bottom-center':
+      default:
+        logoX = (width - logoSize) / 2;
+        logoY = height - logoSize - margin;
+        break;
+      case 'center':
+        logoX = (width - logoSize) / 2;
+        logoY = (height - logoSize) / 2;
+        break;
+    }
+
+    // Aplicar logo con composición suave
+    image.composite(logoClone, Math.round(logoX), Math.round(logoY), {
+      mode: Jimp.BLEND_SOURCE_OVER,
+      opacitySource: 1.0,
+      opacityDest: 1.0
+    });
+
+    return {
+      applied: true,
+      position: { x: logoX, y: logoY },
+      size: logoSize
+    };
+
+  } catch (error) {
+    console.warn("⚠️ No se pudo aplicar logo:", error.message);
+    return {
+      applied: false,
+      error: error.message
+    };
+  }
+}
+
+// ---- Función mejorada para dividir texto con referencias bíblicas separadas ----
+function smartWrapTextWithReferences(text, maxWidth, font, referenceFont) {
+  // Limpiar texto de espacios extra
+  const cleanText = text.trim();
+  
+  // Buscar referencias bíblicas entre paréntesis (más flexible)
+  const referencePattern = /\(([^)]+)\)\s*$/;
+  const match = cleanText.match(referencePattern);
+  
+  let mainText = cleanText;
+  let reference = null;
+  
+  if (match) {
+    // Separar el texto principal de la referencia
+    mainText = cleanText.replace(referencePattern, '').trim();
+    reference = match[1]; // Sin los paréntesis
+    console.log(`📖 Referencia detectada: "${reference}"`);
+    console.log(`📝 Texto principal: "${mainText}"`);
+  }
+
+  // Procesar texto principal
+  const words = mainText.split(' ');
+  const lines = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    const lineWidth = Jimp.measureText(font, testLine);
+    
+    if (lineWidth <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) {
+        lines.push({ text: currentLine, type: 'main' });
+        currentLine = word;
+      } else {
+        lines.push({ text: word, type: 'main' });
+      }
+    }
+  }
+  
+  if (currentLine) {
+    lines.push({ text: currentLine, type: 'main' });
+  }
+
+  // Agregar referencia bíblica como línea separada si existe
+  if (reference) {
+    lines.push({ text: `(${reference})`, type: 'reference' });
+  }
+  
+  return lines;
+}
+
+// ---- Función para dividir texto en líneas inteligentemente (fallback) ----
+function smartWrapText(text, maxWidth, font) {
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    const lineWidth = Jimp.measureText(font, testLine);
+    
+    if (lineWidth <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) {
+        lines.push(currentLine);
+        currentLine = word;
+      } else {
+        lines.push(word);
+      }
+    }
+  }
+  
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+  
+  return lines;
+}
+
+// ---- Estilos minimalistas predefinidos ----
+const minimalistStyles = {
+  default: {
+    background: 'white',
+    textColor: Jimp.rgbaToInt(0, 0, 0, 255), // Negro puro
+    referenceColor: Jimp.rgbaToInt(102, 102, 102, 255), // Gris para referencias
+    logoPosition: 'bottom-center'
+  },
+  elegant: {
+    background: 'white',
+    textColor: Jimp.rgbaToInt(33, 33, 33, 255), // Negro suave
+    referenceColor: Jimp.rgbaToInt(119, 119, 119, 255), // Gris suave
+    logoPosition: 'top-center'
+  },
+  clean: {
+    background: 'white',
+    textColor: Jimp.rgbaToInt(50, 50, 50, 255), // Gris oscuro
+    referenceColor: Jimp.rgbaToInt(136, 136, 136, 255), // Gris medio
+    logoPosition: 'bottom-right'
+  },
+  minimal: {
+    background: '#f8f9fa', // Blanco suave
+    textColor: Jimp.rgbaToInt(20, 20, 20, 255), // Negro profundo
+    referenceColor: Jimp.rgbaToInt(85, 85, 85, 255), // Gris oscuro
+    logoPosition: 'bottom-center'
+  }
+};
+
+app.post("/generate", async (req, res) => {
+  try {
+    const text = String(req.body?.text ?? "Dios te bendiga");
+    const width = Number(req.body?.width) || 1080;
+    const height = Number(req.body?.height) || 1920;
+    const fontSize = Math.min(Number(req.body?.fontSize) || 72, 128);
+    const styleType = req.body?.style || 'default';
+    const logoPosition = req.body?.logoPosition || 'bottom-center';
+    const logoSize = Math.min(Number(req.body?.logoSize) || 120, 200);
+
+    // Validar estilo
+    const selectedStyle = minimalistStyles[styleType] || minimalistStyles.default;
+
+    // Carga fuente robusta
+    const fontRef = getFontRef(fontSize);
+    const font = await Jimp.loadFont(fontRef);
+    
+    // Fuente más pequeña para referencias (70% del tamaño principal)
+    const referenceFontSize = Math.max(Math.round(fontSize * 0.7), 16);
+    const referenceFontRef = getFontRef(referenceFontSize);
+    const referenceFont = await Jimp.loadFont(referenceFontRef);
+
+    // Crear lienzo con fondo
+    const bgColor = selectedStyle.background === 'white' ? 0xffffffff : 0xf8f9faff;
+    const image = Jimp.create
+      ? await Jimp.create(width, height, bgColor)
+      : new Jimp(width, height, selectedStyle.background);
+
+    // Configurar márgenes para diseño minimalista
+    const horizontalMargin = Math.max(width * 0.1, 60);
+    const verticalMargin = Math.max(height * 0.12, 100);
+    
+    const textWidth = width - horizontalMargin * 2;
+
+    // Calcular espacio disponible para texto (considerando logo)
+    const logoMargin = 40;
+    let availableTextHeight = height - verticalMargin * 2;
+    
+    if (logoPosition.includes('top')) {
+      availableTextHeight -= (logoSize + logoMargin);
+    } else if (logoPosition.includes('bottom')) {
+      availableTextHeight -= (logoSize + logoMargin);
+    }
+
+    // Dividir texto en líneas con soporte para referencias bíblicas
+    const lines = smartWrapTextWithReferences(text, textWidth, font, referenceFont);
+    
+    // Calcular alturas de línea
+    const mainLineHeight = Jimp.measureTextHeight(font, "Ag") * 1.5;
+    const referenceLineHeight = Jimp.measureTextHeight(referenceFont, "Ag") * 1.3;
+    const spaceBetweenMainAndReference = mainLineHeight * 0.5; // Espacio adicional antes de la referencia
+    
+    // Calcular altura total del texto
+    let totalTextHeight = 0;
+    let hasReference = false;
+    
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].type === 'reference') {
+        totalTextHeight += spaceBetweenMainAndReference + referenceLineHeight;
+        hasReference = true;
+      } else {
+        totalTextHeight += mainLineHeight;
+      }
+    }
+
+    // Centrar texto verticalmente
+    let startY = (height - totalTextHeight) / 2;
+    if (logoPosition === 'top-center') {
+      startY = verticalMargin + logoSize + logoMargin + (availableTextHeight - totalTextHeight) / 2;
+    }
+
+    // Aplicar texto línea por línea con diferentes estilos
+    let currentY = startY;
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const isReference = line.type === 'reference';
+      const currentFont = isReference ? referenceFont : font;
+      const currentColor = isReference ? selectedStyle.referenceColor : selectedStyle.textColor;
+      
+      // Agregar espacio extra antes de las referencias
+      if (isReference && i > 0) {
+        currentY += spaceBetweenMainAndReference;
+      }
+      
+      const lineWidth = Jimp.measureText(currentFont, line.text);
+      const x = (width - lineWidth) / 2; // Siempre centrado
+
+      // Crear texto con color personalizado
+      const textImage = Jimp.create ? await Jimp.create(width, height, 0x00000000) : new Jimp(width, height, 0x00000000);
+      textImage.print(currentFont, x, currentY, line.text);
+      
+      // Aplicar color del estilo
+      const rgba = Jimp.intToRGBA(currentColor);
+      textImage.color([
+        { apply: 'red', params: [rgba.r] },
+        { apply: 'green', params: [rgba.g] },
+        { apply: 'blue', params: [rgba.b] }
+      ]);
+      
+      image.composite(textImage, 0, 0);
+      
+      // Avanzar Y para la siguiente línea
+      currentY += isReference ? referenceLineHeight : mainLineHeight;
+    }
+
+    // Aplicar logo desde imagen
+    const logoResult = await applyLogoToImage(image, logoPosition, logoSize);
+
+    const buffer = await image.getBufferAsync(Jimp.MIME_PNG);
+    
+    res.json({ 
+      base64: buffer.toString("base64"),
+      info: {
+        dimensions: `${width}x${height}`,
+        fontSize,
+        referenceFontSize,
+        style: styleType,
+        logoPosition,
+        logoSize,
+        logoApplied: logoResult.applied,
+        logoInfo: logoResult.applied ? `Aplicado en ${logoResult.position.x}, ${logoResult.position.y}` : logoResult.error,
+        mainLines: lines.filter(l => l.type === 'main').length,
+        referenceLines: lines.filter(l => l.type === 'reference').length,
+        totalLines: lines.length,
+        hasReference: lines.some(l => l.type === 'reference'),
+        textDimensions: `${textWidth}x${availableTextHeight}`,
+        theme: "AVE MARIA - Minimalista con Referencias Bíblicas Centradas"
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Error generando imagen AVE MARIA:", err);
+    res.status(500).json({ 
+      error: err.message, 
+      stack: err.stack,
+      suggestion: err.message.includes('logo') ? "Asegúrate de tener el archivo logo.png o logo-ave-maria.png en la carpeta assets/ o raíz del proyecto" : "Error interno del servidor"
+    });
+  }
+});
+
+// Endpoint para verificar si el logo está disponible
+app.get("/logo/status", async (_req, res) => {
+  try {
+    await loadLogo();
+    res.json({
+      available: true,
+      message: "Logo cargado correctamente",
+      cachedLogo: !!cachedLogo
+    });
+  } catch (error) {
+    res.json({
+      available: false,
+      error: error.message,
+      suggestion: "Coloca tu logo en ./assets/logo-ave-maria.png o ./logo.png"
+    });
+  }
+});
+
+// Endpoint para obtener estilos minimalistas disponibles
+app.get("/styles", (_req, res) => {
+  res.json({
+    styles: Object.keys(minimalistStyles).map(key => ({
+      name: key,
+      description: getStyleDescription(key),
+      logoPosition: minimalistStyles[key].logoPosition
+    })),
+    logoPositions: ['top-left', 'top-right', 'top-center', 'bottom-left', 'bottom-right', 'bottom-center', 'center'],
+    description: "Estilos minimalistas con logo AVE MARIA desde archivo de imagen",
+    features: "Soporte para referencias bíblicas centradas y diferenciadas"
+  });
+});
+
+function getStyleDescription(style) {
+  const descriptions = {
+    default: "Texto negro sobre fondo blanco puro, referencias en gris, logo en parte inferior",
+    elegant: "Texto negro suave, referencias en gris suave, logo en parte superior",
+    clean: "Texto gris oscuro, referencias en gris medio, logo en esquina inferior derecha",
+    minimal: "Texto negro profundo sobre fondo suave, referencias diferenciadas, logo centrado abajo"
+  };
+  return descriptions[style] || "Estilo minimalista personalizado con referencias bíblicas";
+}
+
+// Endpoint para frases católicas sugeridas con referencias
+app.get("/suggestions", (_req, res) => {
+  const suggestions = {
+    biblical: [
+      "Yo soy el camino, la verdad y la vida (Juan 14:6)",
+      "Todo lo puedo en Cristo que me fortalece (Filipenses 4:13)",
+      "Dios es amor (1 Juan 4:8)",
+      "Bienaventurados los que tienen hambre y sed de justicia (Mateo 5:6)",
+      "Grande es tu fidelidad (Lamentaciones 3:22-23)",
+      "El Señor es mi pastor, nada me faltará (Salmo 23:1)",
+      "Porque tanto amó Dios al mundo (Juan 3:16)",
+      "Vengan a mí todos los que están cansados (Mateo 11:28)"
+    ],
+    devotional: [
+      "María, Madre de Dios, ruega por nosotros",
+      "Jesús, en Ti confío",
+      "Santo Rosario, oración del corazón",
+      "Que la paz de Cristo reine en tu corazón",
+      "Ave María, llena eres de gracia",
+      "Sagrado Corazón de Jesús, en vos confío"
+    ],
+    inspirational: [
+      "Dios tiene planes de bien para ti (Jeremías 29:11)",
+      "Tu fe puede mover montañas (Mateo 17:20)",
+      "En cada amanecer, una nueva gracia (Lamentaciones 3:23)",
+      "El amor de Dios es infinito (Salmo 136:26)",
+      "Confía en el Señor con todo tu corazón (Proverbios 3:5)",
+      "Todo obra para bien de los que aman a Dios (Romanos 8:28)"
+    ],
+    liturgical: [
+      "Gloria al Padre, al Hijo y al Espíritu Santo",
+      "Demos gracias a Dios",
+      "La paz esté con ustedes",
+      "Santo, Santo, Santo es el Señor",
+      "Cordero de Dios que quitas el pecado del mundo",
+      "Por Cristo, con Él y en Él"
+    ]
+  };
+
+  res.json({
+    suggestions,
+    tip: "Las referencias bíblicas entre paréntesis aparecerán centradas y en línea separada",
+    example: "Grande es tu fidelidad (Lamentaciones 3:22-23)"
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ API AVE MARIA corriendo en http://localhost:${PORT}`);
+  console.log(`🖼️ Logo: Se carga desde archivo de imagen`);
+  console.log(`📁 Rutas de logo soportadas:`);
+  console.log(`   - ./assets/logo-ave-maria.png`);
+  console.log(`   - ./assets/logo.png`);
+  console.log(`   - ./logo.png`);
+  console.log(`📖 Nuevo: Referencias bíblicas centradas automáticamente`);
+  console.log(`🤍 Diseño: Minimalista con logo real de alta calidad`);
+  console.log(`📱 Optimizado para YouTube Shorts (1080x1920)`);
+  console.log(`🙏 "Ave María, llena eres de gracia"`);
+});
